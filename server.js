@@ -26,7 +26,7 @@ app.get('/stream', (req, res) => {
         videoUrl = decodeURIComponent(videoUrl);
     }
 
-    console.log('>>> Request URL:', videoUrl);
+    console.log('>>> Processing URL:', videoUrl);
 
     try {
         res.setHeader('Content-Type', 'video/mp4');
@@ -40,14 +40,14 @@ app.get('/stream', (req, res) => {
                 '-reconnect_delay_max', '5'
             ])
             .outputOptions([
-                '-map', '0:v:0', // Chỉ lấy luồng Video đầu tiên
-                '-map', '0:a:0?', // Chỉ lấy luồng Audio đầu tiên (nếu có)
-                '-sn',            // Bỏ qua tất cả phụ đề (Subtitles) - Tránh lỗi SIGSEGV
-                '-dn',            // Bỏ qua luồng Dữ liệu (Data stream)
-                '-c:v', 'copy',   // Giữ nguyên Video format
-                '-c:a', 'aac',    // Chuyển âm thanh về AAC
+                '-map', '0:v:0',
+                '-map', '0:a?',
+                '-sn',
+                '-dn',
+                '-c:v', 'copy',
+                '-c:a', 'aac',
                 '-b:a', '192k',
-                '-format', 'mp4',
+                '-f', 'mp4',
                 '-movflags', 'frag_keyframe+empty_moov+default_base_moov'
             ])
             .on('start', (cmd) => {
