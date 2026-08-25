@@ -1,5 +1,9 @@
 const express = require('express');
 const ffmpeg = require('fluent-ffmpeg');
+const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
+
+// Thêm đường dẫn binary FFmpeg chuẩn
+ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -26,7 +30,7 @@ app.get('/stream', (req, res) => {
         videoUrl = decodeURIComponent(videoUrl);
     }
 
-    console.log('>>> Dang xu ly stream cho URL:', videoUrl);
+    console.log('>>> Request URL:', videoUrl);
 
     try {
         res.setHeader('Content-Type', 'video/mp4');
@@ -47,7 +51,7 @@ app.get('/stream', (req, res) => {
                 '-movflags frag_keyframe+empty_moov+default_base_moov'
             ])
             .on('start', (cmd) => {
-                console.log('>>> FFmpeg da chay:', cmd);
+                console.log('>>> FFmpeg Command:', cmd);
             })
             .on('error', (err) => {
                 if (err.message.includes('Output pipe closed')) return;
