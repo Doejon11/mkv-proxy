@@ -34,24 +34,26 @@ app.get('/stream', (req, res) => {
 
         ffmpeg(videoUrl)
             .inputOptions([
-                '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0',
+                '-user_agent', '"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0"',
                 '-reconnect', '1',
                 '-reconnect_streamed', '1',
                 '-reconnect_delay_max', '5'
             ])
             .outputOptions([
                 '-map', '0:v:0',
-                '-map', '0:a?',
+                '-map', '0:a:0?',
                 '-sn',
                 '-dn',
                 '-c:v', 'copy',
                 '-c:a', 'aac',
+                '-ar', '44100',
+                '-ac', '2',
                 '-b:a', '192k',
                 '-f', 'mp4',
                 '-movflags', 'frag_keyframe+empty_moov+default_base_moov'
             ])
             .on('start', (cmd) => {
-                console.log('>>> FFmpeg Command:', cmd);
+                console.log('>>> FFmpeg Command Running:', cmd);
             })
             .on('error', (err) => {
                 if (err.message.includes('Output pipe closed')) return;
