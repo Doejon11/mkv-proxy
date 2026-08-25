@@ -30,7 +30,6 @@ app.get('/stream', (req, res) => {
 
     const headers = 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36\r\nAccept: */*\r\nConnection: keep-alive';
 
-    // Đã tách rời từng giá trị trong mảng args để không bị lỗi syntax
     const args = [
         '-headers', headers,
         '-reconnect', '1',
@@ -47,9 +46,7 @@ app.get('/stream', (req, res) => {
         '-ac', '2',
         '-b:a', '192k',
         '-f', 'mp4',
-        '-movflags', 'frag_keyframe',
-        '-movflags', 'empty_moov',
-        '-movflags', 'default_base_moov',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moov', // Đã sửa đúng chuẩn: 2 phần tử tách biệt
         'pipe:1'
     ];
 
@@ -62,14 +59,15 @@ app.get('/stream', (req, res) => {
 
     ffmpegProc.stderr.on('data', (data) => {
         const msg = data.toString();
-        if (msg.includes('Error') || msg.includes('Server returned') || msg.includes('Opening')) {
-            console.error('>>> FFmpeg Output:', msg.trim());
+        // Log toàn bộ lỗi thực tế để dễ debug
+        if (msg.includes('Error') || msg.includes('Server returned') || msg.includes('failed')) {
+            console.error('>>> FFmpeg Log:', msg.trim());
         }
     });
 
     ffmpegProc.on('close', (code) => {
         if (code !== 0 && code !== null) {
-            console.log(`>>> FFmpeg Process Exited with code: ${code}`);
+            console.log(`>>> FFmpeg Exited with code: ${code}`);
         }
     });
 
