@@ -26,19 +26,23 @@ app.get('/stream', (req, res) => {
         videoUrl = decodeURIComponent(videoUrl);
     }
 
-    console.log('>>> Processing Stream URL:', videoUrl);
+    // Lấy thông số tua time (ss) và audio track (audio) từ URL
+    const startTime = req.query.ss || '0';
+    const audioTrack = req.query.audio || '0'; // Mặc định là track âm thanh đầu tiên (0)
+
+    console.log(`>>> Processing Stream - Audio Track: ${audioTrack}, Start Time: ${startTime}`);
 
     const headers = 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36\r\nAccept: */*\r\nConnection: keep-alive';
 
-    // Cấu hình FFmpeg Stream chuẩn hóa cho Pipe
     const args = [
         '-headers', headers,
+        '-ss', startTime,
         '-reconnect', '1',
         '-reconnect_streamed', '1',
         '-reconnect_delay_max', '5',
         '-i', videoUrl,
-        '-map', '0:v:0',
-        '-map', '0:a:0?',
+        '-map', '0:v:0',               // Lấy luồng video đầu tiên
+        '-map', `0:a:${audioTrack}?`,  // Chọn luồng âm thanh theo tham số ?audio=
         '-sn',
         '-dn',
         '-c:v', 'copy',
@@ -48,7 +52,7 @@ app.get('/stream', (req, res) => {
         '-b:a', '192k',
         '-f', 'mp4',
         '-movflags', 'frag_keyframe+empty_moov',
-        '-frag_duration', '1000000', // Cắt nhỏ gói tin mỗi 1 giây để stream mượt
+        '-frag_duration', '1000000',
         'pipe:1'
     ];
 
