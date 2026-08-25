@@ -1,9 +1,5 @@
 const express = require('express');
 const ffmpeg = require('fluent-ffmpeg');
-const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
-
-// Thêm đường dẫn binary FFmpeg chuẩn
-ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -43,12 +39,16 @@ app.get('/stream', (req, res) => {
                 '-reconnect_streamed', '1',
                 '-reconnect_delay_max', '5'
             ])
-            .videoCodec('copy')
-            .audioCodec('aac')
-            .audioBitrate('192k')
-            .format('mp4')
             .outputOptions([
-                '-movflags frag_keyframe+empty_moov+default_base_moov'
+                '-map', '0:v:0', // Chỉ lấy luồng Video đầu tiên
+                '-map', '0:a:0?', // Chỉ lấy luồng Audio đầu tiên (nếu có)
+                '-sn',            // Bỏ qua tất cả phụ đề (Subtitles) - Tránh lỗi SIGSEGV
+                '-dn',            // Bỏ qua luồng Dữ liệu (Data stream)
+                '-c:v', 'copy',   // Giữ nguyên Video format
+                '-c:a', 'aac',    // Chuyển âm thanh về AAC
+                '-b:a', '192k',
+                '-format', 'mp4',
+                '-movflags', 'frag_keyframe+empty_moov+default_base_moov'
             ])
             .on('start', (cmd) => {
                 console.log('>>> FFmpeg Command:', cmd);
