@@ -30,6 +30,7 @@ app.get('/stream', (req, res) => {
 
     const headers = 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36\r\nAccept: */*\r\nConnection: keep-alive';
 
+    // Cấu hình FFmpeg Stream chuẩn hóa cho Pipe
     const args = [
         '-headers', headers,
         '-reconnect', '1',
@@ -46,7 +47,8 @@ app.get('/stream', (req, res) => {
         '-ac', '2',
         '-b:a', '192k',
         '-f', 'mp4',
-        '-movflags', 'frag_keyframe+empty_moov+default_base_moov', // Đã sửa đúng chuẩn: 2 phần tử tách biệt
+        '-movflags', 'frag_keyframe+empty_moov',
+        '-frag_duration', '1000000', // Cắt nhỏ gói tin mỗi 1 giây để stream mượt
         'pipe:1'
     ];
 
@@ -59,7 +61,6 @@ app.get('/stream', (req, res) => {
 
     ffmpegProc.stderr.on('data', (data) => {
         const msg = data.toString();
-        // Log toàn bộ lỗi thực tế để dễ debug
         if (msg.includes('Error') || msg.includes('Server returned') || msg.includes('failed')) {
             console.error('>>> FFmpeg Log:', msg.trim());
         }
