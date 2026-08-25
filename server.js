@@ -12,13 +12,13 @@ app.get('/', (req, res) => {
 app.get('/stream', (req, res) => {
     const clientKey = req.query.key;
     if (!clientKey || clientKey !== API_SECRET_KEY) {
-        return res.status(403).send('403 Forbidden');
+        return res.status(403).send('403 Forbidden: Key sai');
     }
 
     const rawReqUrl = req.url;
     const urlMatch = rawReqUrl.match(/[?&]url=([^&]+)/);
     if (!urlMatch || !urlMatch[1]) {
-        return res.status(400).send('400 Bad Request');
+        return res.status(400).send('400 Bad Request: Thiếu URL');
     }
 
     let videoUrl = decodeURIComponent(urlMatch[1]);
@@ -26,8 +26,11 @@ app.get('/stream', (req, res) => {
         videoUrl = decodeURIComponent(videoUrl);
     }
 
+    console.log('>>> Dang xu ly stream cho URL:', videoUrl);
+
     try {
         res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Accept-Ranges', 'bytes');
 
         ffmpeg(videoUrl)
             .inputOptions([
@@ -40,13 +43,20 @@ app.get('/stream', (req, res) => {
             .audioCodec('aac')
             .audioBitrate('192k')
             .format('mp4')
-            .outputOptions(['-movflags frag_keyframe+empty_moov+default_base_moov'])
+            .outputOptions([
+                '-movflags frag_keyframe+empty_moov+default_base_moov'
+            ])
+            .on('start', (cmd) => {
+                console.log('>>> FFmpeg da chay:', cmd);
+            })
             .on('error', (err) => {
                 if (err.message.includes('Output pipe closed')) return;
-                console.error('FFmpeg Error:', err.message);
+                console.error('>>> FFmpeg Error:', err.message);
             })
             .pipe(res, { end: true });
+
     } catch (error) {
+        console.error('>>> Server Error:', error.message);
         if (!res.headersSent) res.status(500).send('Server Error');
     }
 });
