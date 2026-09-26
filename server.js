@@ -8,8 +8,22 @@ const SEGMENT_DURATION = 6; // giây mỗi segment HLS
 
 const HEADERS = 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36\r\nAccept: */*\r\nConnection: keep-alive';
 
-// Cache thông tin file (duration, codec, số kênh audio) để khỏi ffprobe lại mỗi lần
+// Cache thông tin media (duration, codec, số kênh audio) để khỏi ffprobe lại mỗi lần
 const infoCache = new Map();
+
+// ---- Xử lý decode URL an toàn, chịu được cả trường hợp client encode 1 hoặc 2 lớp ----
+function extractParam(reqUrl, paramName) {
+    const regex = new RegExp(`[?&]${paramName}=([^&]+)`);
+    const match = reqUrl.match(regex);
+    if (!match || !match[1]) return null;
+
+    let value = decodeURIComponent(match[1]);
+    // Nếu vẫn còn dấu hiệu encode (client encode 2 lớp), decode thêm lần nữa
+    if (value.includes('%3F') || value.includes('%3D') || value.includes('%26') || value.includes('%3A')) {
+        value = decodeURIComponent(value);
+    }
+    return value;
+}
 
 function checkKey(req, res) {
     if (req.query.key !== API_SECRET_KEY) {
@@ -60,6 +74,8 @@ function probeMedia(videoUrl, audioTrackIndex) {
                 reject(e);
             }
         });
+
+        probe.on('error', (e) => reject(e));
     });
 }
 
@@ -79,9 +95,11 @@ app.get('/', (req, res) => {
 app.get('/playlist.m3u8', async (req, res) => {
     if (!checkKey(req, res)) return;
 
-    const videoUrl = decodeURIComponent(req.query.url || '');
+    const videoUrl = extractParam(req.url, 'url');
     if (!videoUrl) return res.status(400).send('400 Bad Request: Thiếu url');
     const audioTrack = parseInt(req.query.audio || '0', 10);
+
+    console.log('>>> [playlist] Final videoUrl:', videoUrl);
 
     try {
         const info = await probeMedia(videoUrl, audioTrack);
@@ -111,7 +129,7 @@ app.get('/playlist.m3u8', async (req, res) => {
 app.get('/segment', async (req, res) => {
     if (!checkKey(req, res)) return;
 
-    const videoUrl = decodeURIComponent(req.query.url || '');
+    const videoUrl = extractParam(req.url, 'url');
     if (!videoUrl) return res.status(400).send('400 Bad Request: Thiếu url');
     const audioTrack = parseInt(req.query.audio || '0', 10);
     const index = parseInt(req.query.index, 10);
