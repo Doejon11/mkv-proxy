@@ -8,17 +8,14 @@ const SEGMENT_DURATION = 6; // giây mỗi segment HLS
 
 const HEADERS = 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36\r\nAccept: */*\r\nConnection: keep-alive';
 
-// Cache thông tin media (duration, codec, số kênh audio) để khỏi ffprobe lại mỗi lần
 const infoCache = new Map();
 
-// ---- Xử lý decode URL an toàn, chịu được cả trường hợp client encode 1 hoặc 2 lớp ----
 function extractParam(reqUrl, paramName) {
     const regex = new RegExp(`[?&]${paramName}=([^&]+)`);
     const match = reqUrl.match(regex);
     if (!match || !match[1]) return null;
 
     let value = decodeURIComponent(match[1]);
-    // Nếu vẫn còn dấu hiệu encode (client encode 2 lớp), decode thêm lần nữa
     if (value.includes('%3F') || value.includes('%3D') || value.includes('%26') || value.includes('%3A')) {
         value = decodeURIComponent(value);
     }
@@ -33,7 +30,19 @@ function checkKey(req, res) {
     return true;
 }
 
-// Lấy duration + thông tin audio track (codec, số kênh) bằng 1 lần ffprobe
+// Chuẩn hoá tên layout: bỏ hậu tố kiểu "(side)", "(wide)" gây lỗi PCE khi encode AAC
+function normalizeChannelLayout(rawLayout, channels) {
+    if (rawLayout) {
+        const cleaned = rawLayout.replace(/\s*\([^)]*\)\s*/g, '').trim();
+        if (cleaned) return cleaned;
+    }
+    // Fallback theo số kênh nếu ffprobe không trả về channel_layout
+    if (channels >= 8) return '7.1';
+    if (channels >= 6) return '5.1';
+    if (channels === 1) return 'mono';
+    return 'stereo';
+}
+
 function probeMedia(videoUrl, audioTrackIndex) {
     return new Promise((resolve, reject) => {
         const cacheKey = `${videoUrl}#${audioTrackIndex}`;
@@ -42,7 +51,7 @@ function probeMedia(videoUrl, audioTrackIndex) {
         const args = [
             '-headers', HEADERS,
             '-v', 'error',
-            '-show_entries', 'format=duration:stream=index,codec_type,codec_name,channels',
+            '-show_entries', 'format=duration:stream=index,codec_type,codec_name,channels,channel_layout',
             '-of', 'json',
             videoUrl
         ];
@@ -63,10 +72,12 @@ function probeMedia(videoUrl, audioTrackIndex) {
                 const audioStreams = (data.streams || []).filter(s => s.codec_type === 'audio');
                 const chosen = audioStreams[audioTrackIndex] || audioStreams[0];
 
+                const channels = chosen ? (chosen.channels || 2) : 2;
                 const info = {
                     duration,
                     audioCodec: chosen ? chosen.codec_name : null,
-                    channels: chosen ? (chosen.channels || 2) : 2
+                    channels,
+                    channelLayout: normalizeChannelLayout(chosen ? chosen.channel_layout : null, channels)
                 };
                 infoCache.set(cacheKey, info);
                 resolve(info);
@@ -79,19 +90,17 @@ function probeMedia(videoUrl, audioTrackIndex) {
     });
 }
 
-// Chọn bitrate AAC theo số kênh, đảm bảo chất lượng tương đương nguồn
 function bitrateForChannels(channels) {
-    if (channels >= 8) return '640k';   // 7.1
-    if (channels >= 6) return '448k';   // 5.1
-    if (channels >= 3) return '256k';   // 3.x/quad hiếm gặp
-    return '192k';                       // stereo/mono
+    if (channels >= 8) return '640k';
+    if (channels >= 6) return '448k';
+    if (channels >= 3) return '256k';
+    return '192k';
 }
 
 app.get('/', (req, res) => {
     res.send('HLS Audio-Transcode Proxy đang hoạt động!');
 });
 
-// Sinh playlist HLS (VOD) — client tua bằng cách nhảy segment
 app.get('/playlist.m3u8', async (req, res) => {
     if (!checkKey(req, res)) return;
 
@@ -125,7 +134,6 @@ app.get('/playlist.m3u8', async (req, res) => {
     }
 });
 
-// Sinh từng segment .ts theo yêu cầu
 app.get('/segment', async (req, res) => {
     if (!checkKey(req, res)) return;
 
@@ -141,16 +149,18 @@ app.get('/segment', async (req, res) => {
     try {
         const info = await probeMedia(videoUrl, audioTrack);
         if (info.audioCodec === 'aac') {
-            // Nguồn đã là AAC -> copy thẳng, khỏi tốn CPU encode lại
             audioArgs = ['-c:a', 'copy'];
         } else {
-            // Mọi codec khác (ac3, eac3, dts, truehd, mp3, ...) -> transcode sang AAC, giữ nguyên số kênh
-            audioArgs = ['-c:a', 'aac', '-b:a', bitrateForChannels(info.channels)];
+            audioArgs = [
+                '-c:a', 'aac',
+                '-b:a', bitrateForChannels(info.channels),
+                '-channel_layout', info.channelLayout   // <-- fix lỗi PCE / không tương thích Android
+            ];
         }
-        console.log(`>>> Segment ${index}: audioCodec=${info.audioCodec}, channels=${info.channels}`);
+        console.log(`>>> Segment ${index}: audioCodec=${info.audioCodec}, channels=${info.channels}, layout=${info.channelLayout}`);
     } catch (e) {
         console.error('>>> Lỗi probe segment, fallback transcode mặc định:', e.message);
-        audioArgs = ['-c:a', 'aac', '-b:a', '448k'];
+        audioArgs = ['-c:a', 'aac', '-b:a', '448k', '-channel_layout', '5.1'];
     }
 
     const args = [
