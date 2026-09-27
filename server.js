@@ -4,11 +4,14 @@ const { spawn } = require('child_process');
 const app = express();
 const PORT = process.env.PORT || 10000;
 const API_SECRET_KEY = 'Chuoi_Bao_Mat_VR_123';
-const SEGMENT_DURATION = 8; // giây mỗi segment HLS
+const SEGMENT_DURATION = 8;
 
 const HEADERS = 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36\r\nAccept: */*\r\nConnection: keep-alive';
 
 const infoCache = new Map();
+// Đảm bảo chỉ 1 kết nối tới TorBox tồn tại tại 1 thời điểm cho mỗi video,
+// tránh bị CDN coi là mở nhiều kết nối đồng thời -> throttle/520.
+const activeConnByKey = new Map(); // key: videoUrl#audio -> ffmpeg process hiện tại
 
 function extractParam(reqUrl, paramName) {
     const regex = new RegExp(`[?&]${paramName}=([^&]+)`);
@@ -101,6 +104,20 @@ function bitrateForChannels(channels) {
     return '192k';
 }
 
+// Đóng hẳn kết nối cũ (nếu có) tới TorBox cho cùng video, và chờ 1 nhịp ngắn
+// để CDN kịp nhận biết kết nối đã đóng trước khi mở kết nối mới.
+function closeActiveConnection(key) {
+    return new Promise((resolve) => {
+        const prev = activeConnByKey.get(key);
+        if (!prev) return resolve();
+
+        console.log(`>>> Đóng kết nối cũ tới TorBox cho key=${key} trước khi mở kết nối mới`);
+        prev.kill('SIGKILL');
+        activeConnByKey.delete(key);
+        setTimeout(resolve, 400); // nhịp nghỉ để CDN nhận biết connection đã đóng
+    });
+}
+
 app.get('/', (req, res) => {
     res.send('HLS Audio-Transcode Proxy đang hoạt động!');
 });
@@ -114,7 +131,6 @@ app.get('/playlist.m3u8', async (req, res) => {
     const audioTrack = parseInt(req.query.audio || '0', 10);
 
     console.log('>>> [playlist] Final videoUrl:', videoUrl);
-    console.log('>>> [playlist] audioTrack requested:', req.query.audio, '-> parsed:', audioTrack);
 
     try {
         const info = await probeMedia(videoUrl, audioTrack);
@@ -150,7 +166,11 @@ app.get('/segment', async (req, res) => {
     const index = parseInt(req.query.index, 10);
     if (isNaN(index)) return res.status(400).send('400 Bad Request: Thiếu index');
 
+    const connKey = `${videoUrl}#${audioTrack}`;
     const startTime = index * SEGMENT_DURATION;
+
+    // Đảm bảo không có 2 kết nối tới TorBox cùng lúc cho cùng video
+    await closeActiveConnection(connKey);
 
     let audioArgs;
     try {
@@ -175,8 +195,7 @@ app.get('/segment', async (req, res) => {
         '-noaccurate_seek',
         '-ss', String(startTime),
         '-reconnect', '1',
-        '-reconnect_streamed', '1',
-        '-reconnect_delay_max', '5',
+        '-reconnect_delay_max', '10',
         '-i', videoUrl,
         '-t', String(SEGMENT_DURATION),
         '-map', '0:v:0',
@@ -192,6 +211,8 @@ app.get('/segment', async (req, res) => {
     res.setHeader('Content-Type', 'video/MP2T');
 
     const ffmpegProc = spawn('ffmpeg', args);
+    activeConnByKey.set(connKey, ffmpegProc);
+
     ffmpegProc.stdout.pipe(res);
 
     ffmpegProc.stderr.on('data', (data) => {
@@ -204,12 +225,18 @@ app.get('/segment', async (req, res) => {
     });
 
     ffmpegProc.on('close', (code) => {
+        if (activeConnByKey.get(connKey) === ffmpegProc) {
+            activeConnByKey.delete(connKey);
+        }
         if (code !== 0 && code !== null) {
             console.log(`>>> FFmpeg[seg${index}] exited code: ${code}`);
         }
     });
 
     req.on('close', () => {
+        if (activeConnByKey.get(connKey) === ffmpegProc) {
+            activeConnByKey.delete(connKey);
+        }
         ffmpegProc.kill('SIGKILL');
     });
 });
