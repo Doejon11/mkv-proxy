@@ -9,10 +9,8 @@ const SEGMENT_DURATION = 14; // giây mỗi segment HLS (nominal, dùng để kh
 const HEADERS = 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36\r\nAccept: */*\r\nConnection: keep-alive';
 
 const infoCache = new Map();
-// Ghi sổ điểm bắt đầu/thời lượng THỰC TẾ của từng segment đã generate,
-// để segment sau nối tiếp chính xác từ chỗ segment trước thực sự kết thúc
-// (thay vì giả định cứng index * SEGMENT_DURATION, tránh dồn lệch theo thời gian).
-const segmentLedger = new Map(); // key: videoUrl#audioTrack -> array [{start, duration}, ...]
+const segmentLedger = new Map();     // key: videoUrl#audio -> [{start, duration}, ...]
+const inFlightSegments = new Map();  // key: videoUrl#audio#index -> true khi đang xử lý
 
 function getLedger(key) {
     if (!segmentLedger.has(key)) segmentLedger.set(key, []);
@@ -37,6 +35,12 @@ function checkKey(req, res) {
         return false;
     }
     return true;
+}
+
+function noCache(res) {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
 }
 
 function normalizeChannelLayout(rawLayout, channels) {
@@ -104,7 +108,6 @@ function bitrateForChannels(channels) {
     return '192k';
 }
 
-// Parse dòng cuối "time=00:01:23.45" trong log ffmpeg để biết thời lượng THỰC TẾ đã xuất ra
 function parseActualDuration(stderrText, fallback) {
     const matches = [...stderrText.matchAll(/time=(\d{2}):(\d{2}):(\d{2}\.\d+)/g)];
     if (matches.length === 0) return fallback;
@@ -121,19 +124,21 @@ app.get('/', (req, res) => {
 
 app.get('/playlist.m3u8', async (req, res) => {
     if (!checkKey(req, res)) return;
+    noCache(res);
 
     const videoUrl = extractParam(req.url, 'url');
     if (!videoUrl) return res.status(400).send('400 Bad Request: Thiếu url');
     const audioTrack = parseInt(req.query.audio || '0', 10);
 
     console.log('>>> [playlist] Final videoUrl:', videoUrl);
+    console.log('>>> [playlist] audioTrack requested:', req.query.audio, '-> parsed:', audioTrack);
 
     try {
         const info = await probeMedia(videoUrl, audioTrack);
         const numSegments = Math.ceil(info.duration / SEGMENT_DURATION);
 
         let m3u8 = '#EXTM3U\n#EXT-X-VERSION:3\n';
-        m3u8 += `#EXT-X-TARGETDURATION:${SEGMENT_DURATION + 2}\n`; // +2 đệm an toàn vì thời lượng thực tế có thể nhỉnh hơn nominal
+        m3u8 += `#EXT-X-TARGETDURATION:${SEGMENT_DURATION + 2}\n`;
         m3u8 += '#EXT-X-PLAYLIST-TYPE:VOD\n';
         m3u8 += '#EXT-X-MEDIA-SEQUENCE:0\n';
 
@@ -154,6 +159,7 @@ app.get('/playlist.m3u8', async (req, res) => {
 
 app.get('/segment', async (req, res) => {
     if (!checkKey(req, res)) return;
+    noCache(res);
 
     const videoUrl = extractParam(req.url, 'url');
     if (!videoUrl) return res.status(400).send('400 Bad Request: Thiếu url');
@@ -162,15 +168,21 @@ app.get('/segment', async (req, res) => {
     if (isNaN(index)) return res.status(400).send('400 Bad Request: Thiếu index');
 
     const ledgerKey = `${videoUrl}#${audioTrack}`;
+    const segKey = `${videoUrl}#${audioTrack}#${index}`;
     const ledger = getLedger(ledgerKey);
 
-    // Nối tiếp chính xác từ điểm KẾT THÚC THỰC TẾ của segment liền trước (nếu đã có),
-    // thay vì giả định cứng index * SEGMENT_DURATION -> tránh lệch dồn theo thời gian.
+    // Chống trùng lặp: nếu segment này đang có 1 tiến trình ffmpeg xử lý,
+    // từ chối request trùng thay vì spawn thêm 1 tiến trình nữa tranh CPU.
+    if (inFlightSegments.has(segKey)) {
+        console.log(`>>> Segment ${index} đang được xử lý, bỏ qua request trùng`);
+        return res.status(409).end();
+    }
+    inFlightSegments.set(segKey, true);
+
     let startTime;
     if (ledger[index - 1]) {
         startTime = ledger[index - 1].start + ledger[index - 1].duration;
     } else {
-        // Segment đầu tiên, hoặc người dùng tua nhảy tới chỗ chưa từng generate -> dùng ước lượng
         startTime = index * SEGMENT_DURATION;
     }
 
@@ -186,7 +198,7 @@ app.get('/segment', async (req, res) => {
                 '-channel_layout', info.channelLayout
             ];
         }
-        console.log(`>>> Segment ${index}: start=${startTime.toFixed(2)}s, audioCodec=${info.audioCodec}, channels=${info.channels}`);
+        console.log(`>>> Segment ${index}: start=${startTime.toFixed(2)}s, audioTrack=${audioTrack}, codec=${info.audioCodec}, channels=${info.channels}`);
     } catch (e) {
         console.error('>>> Lỗi probe segment, fallback transcode mặc định:', e.message);
         audioArgs = ['-c:a', 'aac', '-b:a', '448k', '-channel_layout', '5.1'];
@@ -194,7 +206,7 @@ app.get('/segment', async (req, res) => {
 
     const args = [
         '-headers', HEADERS,
-        '-noaccurate_seek',              // <-- ép audio snap cùng điểm keyframe với video, hết lệch trong-segment
+        '-noaccurate_seek',
         '-ss', String(startTime),
         '-reconnect', '1',
         '-reconnect_streamed', '1',
@@ -217,6 +229,13 @@ app.get('/segment', async (req, res) => {
     ffmpegProc.stdout.pipe(res);
 
     let stderrBuffer = '';
+    let cleaned = false;
+    const cleanup = () => {
+        if (cleaned) return;
+        cleaned = true;
+        inFlightSegments.delete(segKey);
+    };
+
     ffmpegProc.stderr.on('data', (data) => {
         const text = data.toString();
         stderrBuffer += text;
@@ -225,6 +244,7 @@ app.get('/segment', async (req, res) => {
 
     ffmpegProc.on('error', (err) => {
         console.error('>>> FFmpeg spawn error:', err);
+        cleanup();
         if (!res.headersSent) res.status(500).end();
     });
 
@@ -232,14 +252,14 @@ app.get('/segment', async (req, res) => {
         if (code !== 0 && code !== null) {
             console.log(`>>> FFmpeg[seg${index}] exited code: ${code}`);
         }
-        // Ghi lại thời lượng THỰC TẾ đã xuất ra để segment kế tiếp nối chính xác
         const actualDuration = parseActualDuration(stderrBuffer, SEGMENT_DURATION);
         ledger[index] = { start: startTime, duration: actualDuration };
-        console.log(`>>> Segment ${index} ledger: start=${startTime.toFixed(2)}, actualDuration=${actualDuration.toFixed(2)}`);
+        cleanup();
     });
 
     req.on('close', () => {
         ffmpegProc.kill('SIGKILL');
+        cleanup();
     });
 });
 
