@@ -4,11 +4,20 @@ const { spawn } = require('child_process');
 const app = express();
 const PORT = process.env.PORT || 10000;
 const API_SECRET_KEY = 'Chuoi_Bao_Mat_VR_123';
-const SEGMENT_DURATION = 6; // giây mỗi segment HLS
+const SEGMENT_DURATION = 14; // giây mỗi segment HLS (nominal, dùng để khai báo playlist)
 
 const HEADERS = 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36\r\nAccept: */*\r\nConnection: keep-alive';
 
 const infoCache = new Map();
+// Ghi sổ điểm bắt đầu/thời lượng THỰC TẾ của từng segment đã generate,
+// để segment sau nối tiếp chính xác từ chỗ segment trước thực sự kết thúc
+// (thay vì giả định cứng index * SEGMENT_DURATION, tránh dồn lệch theo thời gian).
+const segmentLedger = new Map(); // key: videoUrl#audioTrack -> array [{start, duration}, ...]
+
+function getLedger(key) {
+    if (!segmentLedger.has(key)) segmentLedger.set(key, []);
+    return segmentLedger.get(key);
+}
 
 function extractParam(reqUrl, paramName) {
     const regex = new RegExp(`[?&]${paramName}=([^&]+)`);
@@ -30,13 +39,11 @@ function checkKey(req, res) {
     return true;
 }
 
-// Chuẩn hoá tên layout: bỏ hậu tố kiểu "(side)", "(wide)" gây lỗi PCE khi encode AAC
 function normalizeChannelLayout(rawLayout, channels) {
     if (rawLayout) {
         const cleaned = rawLayout.replace(/\s*\([^)]*\)\s*/g, '').trim();
         if (cleaned) return cleaned;
     }
-    // Fallback theo số kênh nếu ffprobe không trả về channel_layout
     if (channels >= 8) return '7.1';
     if (channels >= 6) return '5.1';
     if (channels === 1) return 'mono';
@@ -97,6 +104,17 @@ function bitrateForChannels(channels) {
     return '192k';
 }
 
+// Parse dòng cuối "time=00:01:23.45" trong log ffmpeg để biết thời lượng THỰC TẾ đã xuất ra
+function parseActualDuration(stderrText, fallback) {
+    const matches = [...stderrText.matchAll(/time=(\d{2}):(\d{2}):(\d{2}\.\d+)/g)];
+    if (matches.length === 0) return fallback;
+    const last = matches[matches.length - 1];
+    const h = parseInt(last[1], 10);
+    const m = parseInt(last[2], 10);
+    const s = parseFloat(last[3]);
+    return h * 3600 + m * 60 + s;
+}
+
 app.get('/', (req, res) => {
     res.send('HLS Audio-Transcode Proxy đang hoạt động!');
 });
@@ -115,7 +133,7 @@ app.get('/playlist.m3u8', async (req, res) => {
         const numSegments = Math.ceil(info.duration / SEGMENT_DURATION);
 
         let m3u8 = '#EXTM3U\n#EXT-X-VERSION:3\n';
-        m3u8 += `#EXT-X-TARGETDURATION:${SEGMENT_DURATION}\n`;
+        m3u8 += `#EXT-X-TARGETDURATION:${SEGMENT_DURATION + 2}\n`; // +2 đệm an toàn vì thời lượng thực tế có thể nhỉnh hơn nominal
         m3u8 += '#EXT-X-PLAYLIST-TYPE:VOD\n';
         m3u8 += '#EXT-X-MEDIA-SEQUENCE:0\n';
 
@@ -143,7 +161,18 @@ app.get('/segment', async (req, res) => {
     const index = parseInt(req.query.index, 10);
     if (isNaN(index)) return res.status(400).send('400 Bad Request: Thiếu index');
 
-    const startTime = index * SEGMENT_DURATION;
+    const ledgerKey = `${videoUrl}#${audioTrack}`;
+    const ledger = getLedger(ledgerKey);
+
+    // Nối tiếp chính xác từ điểm KẾT THÚC THỰC TẾ của segment liền trước (nếu đã có),
+    // thay vì giả định cứng index * SEGMENT_DURATION -> tránh lệch dồn theo thời gian.
+    let startTime;
+    if (ledger[index - 1]) {
+        startTime = ledger[index - 1].start + ledger[index - 1].duration;
+    } else {
+        // Segment đầu tiên, hoặc người dùng tua nhảy tới chỗ chưa từng generate -> dùng ước lượng
+        startTime = index * SEGMENT_DURATION;
+    }
 
     let audioArgs;
     try {
@@ -154,10 +183,10 @@ app.get('/segment', async (req, res) => {
             audioArgs = [
                 '-c:a', 'aac',
                 '-b:a', bitrateForChannels(info.channels),
-                '-channel_layout', info.channelLayout   // <-- fix lỗi PCE / không tương thích Android
+                '-channel_layout', info.channelLayout
             ];
         }
-        console.log(`>>> Segment ${index}: audioCodec=${info.audioCodec}, channels=${info.channels}, layout=${info.channelLayout}`);
+        console.log(`>>> Segment ${index}: start=${startTime.toFixed(2)}s, audioCodec=${info.audioCodec}, channels=${info.channels}`);
     } catch (e) {
         console.error('>>> Lỗi probe segment, fallback transcode mặc định:', e.message);
         audioArgs = ['-c:a', 'aac', '-b:a', '448k', '-channel_layout', '5.1'];
@@ -165,6 +194,7 @@ app.get('/segment', async (req, res) => {
 
     const args = [
         '-headers', HEADERS,
+        '-noaccurate_seek',              // <-- ép audio snap cùng điểm keyframe với video, hết lệch trong-segment
         '-ss', String(startTime),
         '-reconnect', '1',
         '-reconnect_streamed', '1',
@@ -186,8 +216,11 @@ app.get('/segment', async (req, res) => {
     const ffmpegProc = spawn('ffmpeg', args);
     ffmpegProc.stdout.pipe(res);
 
+    let stderrBuffer = '';
     ffmpegProc.stderr.on('data', (data) => {
-        console.error(`>>> FFmpeg[seg${index}]:`, data.toString().trim());
+        const text = data.toString();
+        stderrBuffer += text;
+        console.error(`>>> FFmpeg[seg${index}]:`, text.trim());
     });
 
     ffmpegProc.on('error', (err) => {
@@ -199,6 +232,10 @@ app.get('/segment', async (req, res) => {
         if (code !== 0 && code !== null) {
             console.log(`>>> FFmpeg[seg${index}] exited code: ${code}`);
         }
+        // Ghi lại thời lượng THỰC TẾ đã xuất ra để segment kế tiếp nối chính xác
+        const actualDuration = parseActualDuration(stderrBuffer, SEGMENT_DURATION);
+        ledger[index] = { start: startTime, duration: actualDuration };
+        console.log(`>>> Segment ${index} ledger: start=${startTime.toFixed(2)}, actualDuration=${actualDuration.toFixed(2)}`);
     });
 
     req.on('close', () => {
